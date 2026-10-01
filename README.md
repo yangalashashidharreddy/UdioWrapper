@@ -156,6 +156,100 @@ Each method in the `UdioWrapper` class can take several parameters to control so
 These parameters allow full customization of the music generation process, from the initial creation through extensions to the final outro, giving users the ability to tailor both the music and lyrics to fit their specific needs or artistic vision.
 
 
+## Fixing `500 Server Error` on `/generate-proxy` — Auto-solving hCaptcha (issue #7)
+
+Udio added an **invisible hCaptcha** check in front of `POST /api/generate-proxy`.
+When the backend cannot verify a valid hCaptcha token it answers with
+`500 Internal Server Error` (sometimes `403`/`503`), which is the error reported in
+[#7](https://github.com/flowese/UdioWrapper/issues/7):
+
+> `Error making POST request to https://www.udio.com/api/generate-proxy: 500 Server Error`
+
+`UdioWrapper` now handles this automatically:
+
+1. First attempt goes out *without* a token (legacy behaviour, no extra cost).
+2. If the response looks like a captcha block (`403`/`500`/`503` or captcha keywords
+   in the body), the wrapper solves a fresh hCaptcha token, injects it as the
+   `h-captcha-response` header **and** as `captchaToken` in the payload, and retries
+   with backoff.
+3. Other transient errors (`429`/`502`/`504`, network errors) are retried with backoff.
+4. `401` fails fast with a hint that your `sb-api-auth-token` cookie expired.
+
+### Option A — Automatic solving (recommended)
+
+Provide an API key from a captcha-solving service. The Udio sitekey
+(`2945592b-1928-43a9-8473-7e7fed3d752e`) is detected automatically.
+
+```python
+from udio_wrapper import UdioWrapper
+
+# 2captcha (https://2captcha.com)
+udio = UdioWrapper(auth_token, captcha_api_key="YOUR_2CAPTCHA_KEY", captcha_service="2captcha")
+
+# or Capsolver (https://capsolver.com)
+udio = UdioWrapper(auth_token, captcha_api_key="YOUR_CAPSOLVER_KEY", captcha_service="capsolver")
+
+# or NopeCHA (https://nopecha.com) — also via convenience kwargs:
+udio = UdioWrapper(auth_token, capsolver_api_key="YOUR_CAPSOLVER_KEY")
+udio = UdioWrapper(auth_token, nopecha_api_key="YOUR_NOPECHA_KEY")
+```
+
+You can also use environment variables instead of constructor args:
+
+```bash
+export CAPTCHA_API_KEY="YOUR_2CAPTCHA_KEY"        # 2captcha
+export CAPSOLVER_API_KEY="YOUR_CAPSOLVER_KEY"     # Capsolver
+export NOPECHA_API_KEY="YOUR_NOPECHA_KEY"         # NopeCHA
+```
+
+```python
+udio = UdioWrapper(auth_token)  # picks up the env key automatically
+```
+
+Custom solver (any vendor, or your own logic):
+
+```python
+def my_solver(sitekey, site_url):
+    # ... return an h-captcha-response token string ...
+    return token
+
+udio = UdioWrapper(auth_token, solver_callback=my_solver)
+```
+
+### Option B — Manual token (free, one generation at a time)
+
+1. Open https://www.udio.com in your browser, open DevTools → Network.
+2. Trigger a generation once manually (solve the hCaptcha if prompted).
+3. Copy the `h-captcha-response` token sent with the `/generate-proxy` request.
+4. Pass it in (tokens are single-use and short-lived):
+
+```python
+udio = UdioWrapper(auth_token, captcha_token="PASTE_H_CAPTCHA_RESPONSE_TOKEN")
+# or later:
+udio.set_captcha_token("PASTE_H_CAPTCHA_RESPONSE_TOKEN")
+```
+
+### Without any solver
+
+Existing code keeps working unchanged: the wrapper still retries transient
+`5xx`/`429` errors with backoff and prints a hint about configuring a solver.
+But repeated `500`s on `/generate-proxy` will persist until a valid token is supplied.
+
+### Troubleshooting checklist
+
+- **Still `500` after configuring a solver?** Check your solver balance/quota, and
+  make sure the service supports hCaptcha (`HCaptchaTaskProxyLess`).
+- **`401 Unauthorized`?** Your `sb-api-auth-token` cookie expired — sign in again at
+  udio.com and copy the fresh cookie value.
+- **`429` / slow?** You are rate-limited — wait a bit; the wrapper already backs off.
+- **Browser/Selenium worked twice then stopped?** Udio fingerprints automation
+  (see issue discussion). The API + solver approach above is more reliable than
+  driving a browser.
+
+> Note: bypassing anti-bot protection may violate Udio's Terms of Service.
+> This feature is provided for educational/research purposes — use at your own risk.
+
+
 ## License
 
 This project is licensed under the MIT License.
