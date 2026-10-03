@@ -11,6 +11,45 @@ Written by @Flowese
 
 `udio_wrapper` is a Python package that allows you to generate music tracks from Udio's API using textual prompts. This package is designed to interact with Udio's API and is not officially endorsed by Udio.
 
+**Known limitation (Issue #7):** Since April 2024, `POST /api/generate-proxy` returns HTTP 500 (sometimes 403/503) for automated requests. The causes are Udio's human-verification/bot protection, an expired or renamed auth session cookie (see Issue #10), and occasional transient backend errors. There is no supported programmatic way to pass Udio's verification — the human must complete it in their own browser.
+
+To use the wrapper productively:
+
+1. Open https://www.udio.com/ in your own browser and sign in.
+2. Complete any verification challenge the site shows you.
+3. Run one generation manually from the Udio site UI.
+4. Copy a fresh auth cookie: either `sb-api-auth-token` or `sb-ssr-production-auth-token`.
+5. Pass it to `UdioWrapper`, setting `cookie_name` to the matching cookie name, and pause between requests.
+
+Solver integrations (2captcha, CapSolver, NoPECHA, etc.) are intentionally excluded — they would violate Udio's Terms of Service.
+
+### Troubleshooting checklist
+
+- HTTP 401 -> your session cookie expired or was renamed; sign in again and copy a fresh cookie.
+- HTTP 500/403/503 -> a verification/bot-protection refusal; complete the challenge in your browser, then retry with the fresh cookie.
+- HTTP 429 -> you are sending requests too quickly; increase delays.
+- Network error -> check connectivity; the wrapper retries a few times with backoff.
+
+Run `python live_check.py` with `UDIO_AUTH_TOKEN` (and optionally `UDIO_COOKIE_NAME`) set for a one-shot diagnostic that prints the status, body snippet, and next steps.
+
+### Browser-backed client (Issue #7 workaround)
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+```python
+from udio_wrapper import UdioBrowserClient
+
+with UdioBrowserClient() as client:
+    client.wait_for_login()          # log in + complete any challenge in the open window
+    songs = client.create_song("Relaxing jazz and soulful music")
+    client.download_songs(songs)
+```
+
+Your session persists in `~/.udio_wrapper_browser`, so you normally only log in once. `extend`/`add_outro` are not automated — do those steps in the same browser window.
+
 ## Advantages Over Other Models
 
 Unlike other music generation models, Udio offers a unique feature of extending or conditioning new tracks based on existing ones, making it ideal for iterative and creative music production processes.
@@ -57,7 +96,7 @@ pip install git+https://github.com/flowese/UdioWrapper.git
    - In Chrome: `Ctrl+Shift+I` or `F12` on Windows, `Cmd+Option+I` on Mac.
 3. Go to the `Application` tab.
 4. On the left panel, locate and click on `Cookies`, then select the Ideogram website.
-5. Find the cookie named `sb-api-auth-token`.
+5. Find the cookie named `sb-api-auth-token` (older sessions) or `sb-ssr-production-auth-token` (current sessions, see Issue #10) and copy its value.
 6. Click on `sb-api-auth-token` and copy the value in the `Value` field.
 
 ![Udio Wrapper](screen_cookies.jpeg)
@@ -154,100 +193,6 @@ Each method in the `UdioWrapper` class can take several parameters to control so
 
 
 These parameters allow full customization of the music generation process, from the initial creation through extensions to the final outro, giving users the ability to tailor both the music and lyrics to fit their specific needs or artistic vision.
-
-
-## Fixing `500 Server Error` on `/generate-proxy` — Auto-solving hCaptcha (issue #7)
-
-Udio added an **invisible hCaptcha** check in front of `POST /api/generate-proxy`.
-When the backend cannot verify a valid hCaptcha token it answers with
-`500 Internal Server Error` (sometimes `403`/`503`), which is the error reported in
-[#7](https://github.com/flowese/UdioWrapper/issues/7):
-
-> `Error making POST request to https://www.udio.com/api/generate-proxy: 500 Server Error`
-
-`UdioWrapper` now handles this automatically:
-
-1. First attempt goes out *without* a token (legacy behaviour, no extra cost).
-2. If the response looks like a captcha block (`403`/`500`/`503` or captcha keywords
-   in the body), the wrapper solves a fresh hCaptcha token, injects it as the
-   `h-captcha-response` header **and** as `captchaToken` in the payload, and retries
-   with backoff.
-3. Other transient errors (`429`/`502`/`504`, network errors) are retried with backoff.
-4. `401` fails fast with a hint that your `sb-api-auth-token` cookie expired.
-
-### Option A — Automatic solving (recommended)
-
-Provide an API key from a captcha-solving service. The Udio sitekey
-(`2945592b-1928-43a9-8473-7e7fed3d752e`) is detected automatically.
-
-```python
-from udio_wrapper import UdioWrapper
-
-# 2captcha (https://2captcha.com)
-udio = UdioWrapper(auth_token, captcha_api_key="YOUR_2CAPTCHA_KEY", captcha_service="2captcha")
-
-# or Capsolver (https://capsolver.com)
-udio = UdioWrapper(auth_token, captcha_api_key="YOUR_CAPSOLVER_KEY", captcha_service="capsolver")
-
-# or NopeCHA (https://nopecha.com) — also via convenience kwargs:
-udio = UdioWrapper(auth_token, capsolver_api_key="YOUR_CAPSOLVER_KEY")
-udio = UdioWrapper(auth_token, nopecha_api_key="YOUR_NOPECHA_KEY")
-```
-
-You can also use environment variables instead of constructor args:
-
-```bash
-export CAPTCHA_API_KEY="YOUR_2CAPTCHA_KEY"        # 2captcha
-export CAPSOLVER_API_KEY="YOUR_CAPSOLVER_KEY"     # Capsolver
-export NOPECHA_API_KEY="YOUR_NOPECHA_KEY"         # NopeCHA
-```
-
-```python
-udio = UdioWrapper(auth_token)  # picks up the env key automatically
-```
-
-Custom solver (any vendor, or your own logic):
-
-```python
-def my_solver(sitekey, site_url):
-    # ... return an h-captcha-response token string ...
-    return token
-
-udio = UdioWrapper(auth_token, solver_callback=my_solver)
-```
-
-### Option B — Manual token (free, one generation at a time)
-
-1. Open https://www.udio.com in your browser, open DevTools → Network.
-2. Trigger a generation once manually (solve the hCaptcha if prompted).
-3. Copy the `h-captcha-response` token sent with the `/generate-proxy` request.
-4. Pass it in (tokens are single-use and short-lived):
-
-```python
-udio = UdioWrapper(auth_token, captcha_token="PASTE_H_CAPTCHA_RESPONSE_TOKEN")
-# or later:
-udio.set_captcha_token("PASTE_H_CAPTCHA_RESPONSE_TOKEN")
-```
-
-### Without any solver
-
-Existing code keeps working unchanged: the wrapper still retries transient
-`5xx`/`429` errors with backoff and prints a hint about configuring a solver.
-But repeated `500`s on `/generate-proxy` will persist until a valid token is supplied.
-
-### Troubleshooting checklist
-
-- **Still `500` after configuring a solver?** Check your solver balance/quota, and
-  make sure the service supports hCaptcha (`HCaptchaTaskProxyLess`).
-- **`401 Unauthorized`?** Your `sb-api-auth-token` cookie expired — sign in again at
-  udio.com and copy the fresh cookie value.
-- **`429` / slow?** You are rate-limited — wait a bit; the wrapper already backs off.
-- **Browser/Selenium worked twice then stopped?** Udio fingerprints automation
-  (see issue discussion). The API + solver approach above is more reliable than
-  driving a browser.
-
-> Note: bypassing anti-bot protection may violate Udio's Terms of Service.
-> This feature is provided for educational/research purposes — use at your own risk.
 
 
 ## License
